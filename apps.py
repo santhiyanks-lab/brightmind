@@ -1,6 +1,6 @@
 from django.apps import AppConfig
 
 
-class StoriesConfig(AppConfig):
+class VoiceChatConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
-    name = 'stories'
+    name = 'voice_chat'

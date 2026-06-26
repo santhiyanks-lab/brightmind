@@ -1,87 +1,141 @@
-﻿from rest_framework.decorators import api_view, permission_classes
+from django.shortcuts import render
+from rest_framework.decorators import api_view, permission_classes, parser_classes
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
+from django.core.files.storage import default_storage
+from django.conf import settings
+from pathlib import Path
+import uuid
+
 from brightmind.ai_service import ask_claude
-import random
+from brightmind.voice_service import speech_to_text, text_to_speech, cleanup_old_audio
+from chat.models import ChatSession, ChatMessage
+from django.utils import timezone
 
-STORY_THEMES = [
-    "forest adventure", "space explorer",
-    "underwater kingdom", "magic school",
-    "brave village child", "dinosaur world",
-    "superhero city", "fairy tale kingdom",
-    "pirate treasure", "time travel",
-    "animal safari", "robot factory",
-]
 
-LANG_STYLE_EXAMPLES = {
-    "tamil":     "எழுது இப்படி: 'ஒரு ஊர்ல ஒரு பையன் இருந்தான்டா! அவன் ரொம்ப தைரியசாலி. ஒரு நாள் காட்டுக்கு போனான். திடீர்னு ஒரு சிங்கம் வந்துச்சு! ஆனா அவன் பயப்படல. கடைசில அவன் வெற்றி பெற்றான்டா!'",
-    "hindi":     "Aise likho: 'Ek baar ek ladka tha yaar! Wo bahut brave tha. Ek din wo jungle gaya. Achanak ek sher aa gaya! Par wo dara nahi. Aakhir mein uski jeet hui!'",
-    "telugu":    "ఇలా రాయి: 'ఒక ఊర్లో ఒక అబ్బాయి ఉండేవాడు రా! అతను చాలా ధైర్యంగా ఉండేవాడు. చివరకు అతను గెలిచాడు!'",
-    "kannada":   "ಹೀಗೆ ಬರೆ: 'ಒಂದು ಊರಲ್ಲಿ ಒಂದು ಹುಡುಗ ಇದ್ದ ಕಣೋ! ಕೊನೆಗೆ ಅವನು ಗೆದ್ದ!'",
-    "malayalam": "ഇങ്ങനെ എഴുതൂ: 'ഒരു ഗ്രാമത്തിൽ ഒരു കുട്ടി ഉണ്ടായിരുന്നു! അവസാനം അവൻ ജയിച്ചു!'",
-    "bengali":   "এভাবে লেখো: 'একটা গ্রামে একটা ছেলে থাকত! শেষে সে জিতল!'",
-    "english":   "Write like this: 'Once there was a brave kid! One day he went to the forest. Suddenly a lion appeared! But he was not scared. In the end he won!' Use fun simple exciting words.",
-    "french":    "Ecris comme ca: 'Il etait une fois un enfant courageux! A la fin il gagna!'",
-    "spanish":   "Escribe asi: 'Habia una vez un nino valiente! Al final gano!'",
-    "arabic":    "اكتب هكذا: 'كان يا ما كان ولد شجاع! في النهاية انتصر!'",
-    "chinese":   "这样写：'从前有个勇敢的小朋友！最后他赢了！'",
-    "japanese":  "こんなふうに書いて：'むかしむかし、勇敢な子がいたんだよ！最後に勝ったんだよ！'",
-    "korean":    "이렇게 써: '옛날에 용감한 아이가 있었어요! 마지막에 이겼어요!'",
+# Map frontend lang codes to full language names used in ai_service
+# (still used as an optional HINT to Whisper if the frontend explicitly
+# tells us the language — e.g. a manual language picker in the UI)
+LANG_CODE_MAP = {
+    'en': 'english',
+    'hi': 'hindi',
+    'ta': 'tamil',
+    'te': 'telugu',
+    'kn': 'kannada',
+    'ml': 'malayalam',
+    'bn': 'bengali',
+    'mr': 'marathi',
+    'gu': 'gujarati',
+    'pa': 'punjabi',
 }
 
-def get_lang_style(language):
-    return LANG_STYLE_EXAMPLES.get(
-        language,
-        "Write in very simple natural spoken words children use daily. Short fun sentences."
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser])
+def voice_chat(request):
+    if not request.user.is_child():
+        return Response({'error': 'Only children can use voice chat'}, status=403)
+
+    audio_file = request.FILES.get('audio')
+    if not audio_file:
+        return Response({'error': 'No audio file received'}, status=400)
+
+    profile = request.user.child_profile
+    age = profile.age
+
+    # ── Optional language HINT from request (e.g. manual picker in UI) ──
+    # This is NOT forced — it's only passed to Whisper as a hint if present.
+    # If the child speaks a different language than this hint, Whisper will
+    # still auto-detect correctly; the hint just speeds up/refines recognition
+    # when you already know the language for certain.
+    lang_code = request.data.get('lang', '')
+    lang_hint = LANG_CODE_MAP.get(lang_code)  # None if not provided/unknown
+
+    # ── Step 1: Save uploaded audio temporarily ──
+    ext = Path(audio_file.name).suffix or '.webm'
+    temp_name = f"temp_{uuid.uuid4().hex[:8]}{ext}"
+    temp_dir = Path(settings.MEDIA_ROOT) / "temp_audio"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / temp_name
+
+    try:
+        with open(temp_path, 'wb+') as dest:
+            for chunk in audio_file.chunks():
+                dest.write(chunk)
+
+        # ── Step 2: Speech to Text (auto-detects language from audio) ──
+        stt_result = speech_to_text(str(temp_path), language=lang_hint)
+        child_text = stt_result['text']
+        language = stt_result['language']  # <-- the ACTUAL spoken language
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    if not child_text:
+        return Response({
+            'error': 'Could not understand the audio. Please speak clearly and try again.'
+        }, status=400)
+
+    # ── Step 3: Get or create today's session + prepare history ──
+    today = timezone.now().date()
+    session, _ = ChatSession.objects.get_or_create(
+        child=request.user,
+        created_at__date=today
     )
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def get_themes(request):
-    return Response({'themes': STORY_THEMES})
+    prev_messages = ChatMessage.objects.filter(session=session).order_by('-created_at')[:6]
+    history = [
+        {
+            "role": "user" if msg.sender == "child" else "assistant",
+            "content": msg.text
+        }
+        for msg in reversed(list(prev_messages))
+    ]
 
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def start_story(request):
+    # ── Step 4: Generate AI response IN THE DETECTED LANGUAGE ──
+    result = ask_claude(
+        child_text,
+        language=language,   # whatever the child actually spoke
+        age=age,
+        mode="chat",
+        history=history
+    )
+    ai_reply = result.get('reply', '')
+
+    if not ai_reply:
+        return Response({'error': 'AI failed to generate a response'}, status=500)
+
+    # ── Step 5: Text to Speech IN THE DETECTED LANGUAGE ──
     try:
-        theme      = request.data.get('theme', 'forest adventure')
-        profile    = request.user.child_profile
-        language   = request.data.get('language', profile.language)
-        age        = profile.age
-        seed       = random.randint(1000, 9999)
-        lang_style = get_lang_style(language)
-
-        prompt = f"""Write a COMPLETE short story #{seed} about '{theme}' for a {age}-year-old child.
-
-RULES:
-- {lang_style}
-- Write ONLY in {language}. No mixing with other languages.
-- Write a FULL story with beginning, middle, and happy ending.
-- Story must be 12-15 sentences long.
-- Use simple short sentences a child can easily read.
-- Make it fun, exciting and adventurous.
-- End with a happy ending and one simple moral lesson.
-- Do NOT give any choices A) B) C). Just tell the complete story.
-- Add "🌟 THE END 🌟" on the last line."""
-
-        result = ask_claude(prompt, language=language, age=age, mode="story")
-        profile.points += 5
-        profile.save()
-
-        return Response({
-            'story':    result['reply'],
-            'theme':    theme,
-            'language': language,
-            'points':   profile.points,
-        })
-
+        audio_url = text_to_speech(ai_reply, language=language)
     except Exception as e:
-        import traceback
-        print("START STORY ERROR:", traceback.format_exc())
-        return Response({'error': str(e)}, status=500)
+        print(f"TTS error: {e}")
+        audio_url = None
 
+    # ── Step 6: Save messages + award points ──
+    ChatMessage.objects.create(
+        session=session,
+        sender='child',
+        text=child_text,
+        is_safe=result.get('safe', True)
+    )
+    ChatMessage.objects.create(
+        session=session,
+        sender='ai',
+        text=ai_reply,
+        is_safe=True
+    )
 
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def continue_story(request):
-    return Response({'story': '', 'points': 0, 'language': 'english', 'is_final': True})
+    profile.points += 3
+    profile.save()
+
+    cleanup_old_audio()
+
+    return Response({
+        'transcript': child_text,   # ✅ matches frontend res.data.transcript
+        'reply': ai_reply,          # ✅ matches frontend res.data.reply
+        'audio_url': audio_url,     # ✅ matches frontend res.data.audio_url
+        'language': language,       # ✅ now reflects ACTUAL detected language
+        'points': profile.points,
+    })
