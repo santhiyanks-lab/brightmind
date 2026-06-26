@@ -1,0 +1,37 @@
+﻿
+    except Exception as e:
+        print(f"âŒ Whisper error: {e}")                        # âœ…
+        return ""
+
+
+def text_to_speech(text: str, language: str = "tamil") -> str:
+    lang_code  = LANGUAGE_CODES.get(language, {}).get("gtts", "ta")
+    audio_dir  = Path(settings.MEDIA_ROOT) / "voice_replies"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    filename   = f"reply_{uuid.uuid4().hex[:8]}.mp3"           # âœ…
+    audio_path = audio_dir / filename
+
+    try:
+        tts = gTTS(text=text, lang=lang_code, slow=False)
+        tts.save(str(audio_path))
+        print(f"ðŸ”Š gTTS saved [{language}]: {filename}")       # âœ…
+
+        audio_url = f"{settings.MEDIA_URL}voice_replies/{filename}"  # âœ…
+        return audio_url
+
+    except Exception as e:
+        print(f"âŒ gTTS error: {e}")                           # âœ…
+        return ""
+
+
+def cleanup_old_audio():
+    import time
+    audio_dir = Path(settings.MEDIA_ROOT) / "voice_replies"
+    if not audio_dir.exists():
+        return
+    now = time.time()
+    for f in audio_dir.iterdir():
+        if now - f.stat().st_mtime > 3600:
+            f.unlink()
+            print(f"ðŸ—‘ Deleted old audio: {f.name}")           # âœ…
